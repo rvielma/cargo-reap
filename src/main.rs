@@ -32,7 +32,11 @@ fn run() -> Result<()> {
         .collect();
 
     let mut path = PathBuf::from("target");
-    let mut keep_configs = 1usize;
+    // Por defecto se conservan TODAS las configuraciones del workspace. Podar por
+    // recencia es inseguro: `invoked.timestamp` sólo avanza en las unidades que
+    // Cargo recompila, así que la variante más reciente no es la que vas a
+    // construir, sino la última que tocó una recompilación. Ver `raices()`.
+    let mut keep_configs = usize::MAX;
     let mut list_dead = false;
     let mut mode = sweep::Mode::DryRun;
     let mut incremental = false;
@@ -44,6 +48,14 @@ fn run() -> Result<()> {
             "--keep-configs" => {
                 let v = it.next().copied().unwrap_or("1");
                 keep_configs = v.parse().unwrap_or(1).max(1);
+                eprintln!(
+                    "⚠ --keep-configs {keep_configs}: se descartarán configuraciones \
+                     del workspace por antigüedad."
+                );
+                eprintln!(
+                    "  Si la que construyes a continuación es una de ellas, el build \
+                     recompila entero."
+                );
             }
             "--list-dead" => list_dead = true,
             "--apply" => {
@@ -64,9 +76,11 @@ fn run() -> Result<()> {
                 println!("Marca como vivo todo artefacto alcanzable desde las unidades");
                 println!("del workspace, siguiendo el grafo de .fingerprint/.");
                 println!();
-                println!("  --keep-configs N   conserva las N configuraciones más");
-                println!("                     recientes de cada unidad (por defecto 1).");
-                println!("                     Súbelo si alternas juegos de features.");
+                println!("  --keep-configs N   conserva sólo las N configuraciones más");
+                println!("                     recientes de cada unidad. Por defecto se");
+                println!("                     conservan todas, que es lo seguro: podar");
+                println!("                     por antigüedad puede borrar la config que");
+                println!("                     usas y forzar un rebuild completo.");
                 println!("  --list-dead        imprime la ruta de cada archivo muerto,");
                 println!("                     una por línea, sin borrar nada.");
                 println!("  --apply            mueve lo muerto a la papelera");
@@ -543,34 +557,27 @@ fn analyze(
         }
     }
 
-    // 2. Raíces: por cada (paquete del workspace, tipo de unidad), la variante más
-    //    reciente. Son los puntos de entrada del build actual; todo lo demás sólo
-    //    sobrevive si alguna de ellas lo alcanza.
+    // 2. Raíces: TODAS las variantes de cada (paquete del workspace, tipo de unidad)
+    //    cuyo stem siga correspondiendo a un target declarado. Son los puntos de
+    //    entrada; todo lo demás sólo sobrevive si alguna de ellas lo alcanza.
     //
     //    Agrupar por el nombre de archivo completo (`lib-app_core`,
     //    `test-lib-app_core`, `test-integration-test-schema_lifecycle`) da
     //    justo la granularidad correcta: cada tipo de unidad conserva la suya.
+    //
+    //    No se poda por recencia salvo que el usuario lo pida con --keep-configs.
+    //    Quedarse con la variante más reciente parece razonable y es justo el error
+    //    que esta herramienta le critica a `cargo-sweep`: `invoked.timestamp` sólo
+    //    avanza en las unidades que Cargo RECOMPILA, así que la más reciente es la
+    //    de la última recompilación, no la de la próxima build. Un `cargo build
+    //    --features x` deja obsoleta, por fecha, la config del `cargo build` pelado
+    //    que sí vas a usar — y barrerla obliga a recompilar el árbol entero.
+    //
+    //    Además un mismo build abarca varios perfiles a la vez (deps del target,
+    //    build scripts y proc-macros en host), así que tampoco existe una única
+    //    "configuración vigente" que se pueda preservar.
     let anchor = units.iter().filter_map(|u| u.invoked).max();
-    let mut mejores: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
-    for (i, u) in units.iter().enumerate() {
-        let targets = match members.get(u.pkg.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
-        if !stem_vigente(&u.stem, targets) {
-            continue;
-        }
-        mejores
-            .entry((u.pkg.as_str(), u.stem.as_str()))
-            .or_default()
-            .push(i);
-    }
-    let mut roots: Vec<usize> = Vec::new();
-    for (_, mut grupo) in mejores {
-        // Más reciente primero; sin timestamp va al final.
-        grupo.sort_by_key(|&i| std::cmp::Reverse(units[i].invoked));
-        roots.extend(grupo.into_iter().take(keep_configs));
-    }
+    let roots = raices(units, members, keep_configs);
 
     // 3. Alcanzabilidad desde las raíces por las aristas `deps`.
     let mut visto: HashSet<usize> = HashSet::new();
@@ -644,6 +651,43 @@ fn analyze(
 }
 
 /// Recorre `deps/` y reparte cada archivo entre vivo y muerto según su hash.
+/// Unidades del workspace que anclan el conjunto vivo.
+///
+/// Con `keep_configs` al máximo (el valor por defecto) devuelve todas las
+/// variantes de cada `(paquete, tipo de unidad)` cuyo stem siga correspondiendo a
+/// un target declarado hoy. Un valor menor poda por `invoked.timestamp`, que es
+/// inseguro: ver el comentario del paso 2 en [`analyze`].
+fn raices(
+    units: &[fingerprint::Unit],
+    members: &HashMap<String, HashSet<String>>,
+    keep_configs: usize,
+) -> Vec<usize> {
+    let mut grupos: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for (i, u) in units.iter().enumerate() {
+        let targets = match members.get(u.pkg.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
+        if !stem_vigente(&u.stem, targets) {
+            continue;
+        }
+        grupos
+            .entry((u.pkg.as_str(), u.stem.as_str()))
+            .or_default()
+            .push(i);
+    }
+    let mut roots: Vec<usize> = Vec::new();
+    for (_, mut grupo) in grupos {
+        if keep_configs < grupo.len() {
+            // Más reciente primero; sin timestamp va al final.
+            grupo.sort_by_key(|&i| std::cmp::Reverse(units[i].invoked));
+            grupo.truncate(keep_configs);
+        }
+        roots.extend(grupo);
+    }
+    roots
+}
+
 fn clasificar_deps(
     deps_dir: &Path,
     vivos: &HashSet<&str>,
@@ -802,6 +846,54 @@ mod tests {
         let bs: HashSet<String> = ["build_script_build".to_string()].into_iter().collect();
         assert!(stem_vigente("build-script-build", &bs));
         assert!(stem_vigente("run-build-script-build-script-build", &bs));
+    }
+
+    /// Construye una unidad mínima para los tests de selección de raíces.
+    fn unidad(pkg: &str, stem: &str, hash: &str, segundos: u64) -> fingerprint::Unit {
+        fingerprint::Unit {
+            pkg: pkg.to_string(),
+            stem: stem.to_string(),
+            filename_hash: hash.to_string(),
+            fp_hash: None,
+            deps: Vec::new(),
+            invoked: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(segundos)),
+        }
+    }
+
+    /// Regresión: dos configuraciones del mismo paquete del workspace coexisten
+    /// (p. ej. `cargo build` y `cargo build --features x`). La más reciente es la
+    /// del build con features, pero la que se va a construir después es la otra.
+    /// Podar por fecha la barría y forzaba a recompilar el árbol entero.
+    #[test]
+    fn conserva_todas_las_configuraciones_del_workspace() {
+        let units = vec![
+            unidad("app", "lib-app", "aaaaaaaaaaaaaaaa", 100), // config sin features
+            unidad("app", "lib-app", "bbbbbbbbbbbbbbbb", 200), // config con features, más nueva
+        ];
+        let mut members = HashMap::new();
+        members.insert(
+            "app".to_string(),
+            ["app".to_string()].into_iter().collect::<HashSet<String>>(),
+        );
+
+        // Por defecto no se poda: ambas configuraciones anclan el conjunto vivo.
+        let roots = raices(&units, &members, usize::MAX);
+        assert_eq!(roots.len(), 2, "el default debe conservar ambas variantes");
+
+        // Con --keep-configs 1 el usuario pide explícitamente podar, y se queda
+        // sólo la más reciente — que no tiene por qué ser la que va a construir.
+        let roots = raices(&units, &members, 1);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(units[roots[0]].filename_hash, "bbbbbbbbbbbbbbbb");
+    }
+
+    /// Una unidad cuyo paquete ya no está en el workspace no ancla nada, por más
+    /// reciente que sea.
+    #[test]
+    fn un_paquete_ajeno_no_es_raiz() {
+        let units = vec![unidad("ajeno", "lib-ajeno", "cccccccccccccccc", 999)];
+        let members = HashMap::new();
+        assert!(raices(&units, &members, usize::MAX).is_empty());
     }
 
     #[test]

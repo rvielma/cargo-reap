@@ -2,8 +2,10 @@
 
 Recolector de basura para directorios `target/` de Cargo.
 
-**Estado: funcional.** Identifica lo muerto (_mark_) y lo saca (_sweep_). Por
-defecto sólo simula: hay que pasar `--apply` para que toque algo.
+**Estado: funcional en macOS**, validado end-to-end sobre un workspace real de
+3.246 unidades. Identifica lo muerto (_mark_) y lo saca (_sweep_). Por defecto
+sólo simula: hay que pasar `--apply` para que toque algo. Falta validarlo en
+Linux.
 
 ## El problema
 
@@ -12,22 +14,31 @@ rustflag o la versión de rustc, escribe un artefacto nuevo con otro sufijo de
 hash y deja el anterior ahí para siempre. En un proyecto de vida larga la mayor
 parte de `target/` son cadáveres.
 
-Medido sobre proyectos reales (septiembre 2026):
+Medido sobre 20 proyectos reales que ocupan 91.2 GB de `target/`
+(septiembre 2026):
 
 | proyecto | por defecto | `--incremental --codegen` |
 |----------|------------:|--------------------------:|
-| A        |   24.76 GB |  28.84 GB |
-| B        |    7.62 GB |  20.33 GB |
-| C        |    2.01 GB |   6.70 GB |
-| D        |    1.80 GB |   4.61 GB |
-| E        |    1.45 GB |   2.79 GB |
-| F        |    1.05 GB |   1.51 GB |
-| G        |  773.65 MB | 773.65 MB |
+| A        |    3.95 GB |  16.81 GB |
+| B        |  580.68 MB |  16.34 GB |
+| C        |          — |   6.09 GB |
+| D        |    1.75 MB |   4.32 GB |
+| E        |    1.39 GB |   2.75 GB |
+| H        |  163.51 MB | 539.22 MB |
+| I        |  104.50 MB | 104.50 MB |
+| J        |   16.66 MB |  16.66 MB |
 
-Sobre 20 proyectos que ocupan 89.5 GB en total: **39.86 GB recuperables** con la
-configuración por defecto, **66.81 GB** con todo activado. El proyecto A solo
-aporta 24.76 GB porque acumuló 68 variantes de fingerprint de un mismo crate del
-workspace.
+**6.18 GB recuperables** por defecto, **47.23 GB** con todo activado.
+
+Vale la pena leer esa diferencia con cuidado, porque contradice la intuición de
+partida. La recolección por grafo —la parte difícil, la que da nombre a esta
+herramienta— recupera 6.18 GB. Los otros 41 GB salen de `incremental/` y de los
+objetos de codegen de unidades vivas, que no dependen del análisis en absoluto:
+son desechables por construcción.
+
+Si sólo te interesa el espacio, `--incremental --codegen` es casi todo el
+beneficio. El mark por grafo es lo que permite además borrar artefactos muertos
+sin adivinar, que es un problema distinto.
 
 ## Por qué no sirve deduplicar
 
@@ -55,28 +66,38 @@ Cargo solo toca `invoked.timestamp` de las unidades que **recompila**. Una
 dependencia estable mantiene su fecha original indefinidamente, así que su edad
 no dice nada sobre si sigue viva.
 
+Esta herramienta cayó en su propia trampa y tardó en verlo, así que conviene
+dejarlo escrito: el conocimiento de arriba se aplicó al _mark_, pero las raíces
+se elegían por fecha, quedándose con la variante más reciente de cada unidad del
+workspace. Es el mismo error un paso antes. Si tu último build fue
+`cargo build --features x`, la configuración del `cargo build` pelado queda
+obsoleta **por fecha** aunque sea la que vas a usar mañana; al no ser raíz, se
+barre ella y con ella todo su árbol de dependencias.
+
+En un workspace real de 10 paquetes eso barrió 240 de las 306 unidades que el
+build necesitaba: el 78% del conjunto vivo. Por eso hoy el criterio no tiene
+componente temporal.
+
 ## El algoritmo
 
 ```mermaid
 flowchart TD
     A["cargo metadata --no-deps<br/>paquetes del workspace"] --> B
     C["target/*/.fingerprint/<br/>todas las unidades"] --> B
-    B["raíces: por cada par<br/>(paquete, tipo de unidad)<br/>la variante más reciente"] --> D
+    B["raíces: TODAS las variantes<br/>de cada (paquete, tipo de unidad)<br/>con target declarado hoy"] --> D
     C --> E["grafo: aristas 'deps'<br/>del JSON de fingerprint"]
     E --> D["cierre transitivo<br/>desde las raíces"]
     D --> F["conjunto vivo<br/>= sufijos de hash"]
     F --> G["clasificar deps/<br/>vivo vs muerto"]
 ```
 
-Las dos mitades son necesarias y ninguna basta sola:
+Lo que hace vivo a un artefacto es ser alcanzable desde una unidad del
+workspace que todavía corresponda a un target declarado hoy. Nada más. En
+particular **no** se mira la fecha: ver más abajo por qué eso es una trampa.
 
-- **El tiempo solo** no sirve, por lo del `invoked.timestamp` de arriba.
-- **El grafo solo** tampoco: una variante obsoleta sigue siendo alcanzable desde
-  el padre obsoleto que la referenciaba, porque ese padre también sigue ahí.
-
-La combinación sí funciona. Las raíces recientes del workspace fijan la
-configuración vigente, y el cierre transitivo rescata sus dependencias por viejas
-que sean sus fechas.
+Lo que muere, entonces, es lo que ya no alcanza nadie: variantes de una
+dependencia que ningún miembro vivo del workspace referencia, y unidades de
+paquetes o targets que dejaron de existir.
 
 ## Tres detalles de Cargo que costó descubrir
 
@@ -100,7 +121,7 @@ que sean sus fechas.
 cargo reap <ruta-a-target>                     # simula: informa y no toca nada
 cargo reap <ruta-a-target> --apply             # mueve lo muerto a la papelera
 cargo reap <ruta-a-target> --apply --no-trash  # borra directo
-cargo reap <ruta-a-target> --keep-configs 3    # conserva 3 configuraciones
+cargo reap <ruta-a-target> --keep-configs 3    # poda agresiva: puede forzar rebuild
 cargo reap <ruta-a-target> --list-dead         # rutas, una por línea
 
 cargo reap ~/Proyectos --apply --incremental --codegen   # todos de una pasada
@@ -145,22 +166,17 @@ Y una cuarta implícita: **el peor caso de un error es una recompilación**, nun
 un binario incorrecto. Es la diferencia de fondo con una caché de compilador,
 donde una clave mal calculada te hace desplegar algo viejo sin que te enteres.
 
-`--keep-configs` es el único knob real y conviene entenderlo: conserva las N
-configuraciones más recientes de cada unidad. Con 1 se recupera el máximo, pero
-alternar juegos de features obliga a recompilar. La curva no es lineal ni igual
-en todos los proyectos:
+`--keep-configs N` es el único knob real, y por defecto **no está activo**:
+se conservan todas las configuraciones. Pasarlo descarta por antigüedad todas
+menos las N más recientes de cada unidad. Recupera bastante más espacio y puede
+costarte un rebuild completo; la herramienta avisa por stderr cuando lo usas.
 
-| proyecto | keep=1 | keep=2 | keep=3 | keep=5 |
-|----------|-------:|-------:|-------:|-------:|
-| A        | 24.56 GB | 22.49 GB | 21.62 GB | 18.66 GB |
-| B        |  7.53 GB |  1.16 GB |   670 MB |   610 MB |
-| D        |  1.80 GB |  1.34 GB |   992 MB |   232 MB |
+No lo uses en un proyecto en el que alternes juegos de features, perfiles o
+toolchains. Lee la sección siguiente antes de decidir.
 
-El proyecto B cae en picada de keep=1 a keep=2: su segunda configuración más
-reciente pesa 6.4 GB sola. El A casi no baja, porque con 68 variantes conservar 5
-sigue descartando 63.
+## Los dos fallos que encontró la validación
 
-## El fallo que encontró la validación
+### El que encontró un fixture sintético
 
 La primera versión definía las raíces como «por cada par (paquete del workspace,
 tipo de unidad), la variante más reciente». Un test con basura sintética mostró
@@ -172,6 +188,24 @@ Con ella sobrevive todo su subárbol de dependencias.
 El arreglo es pedirle a `cargo metadata` los targets que cada paquete declara
 hoy y exigir que el nombre de la unidad corresponda a uno de ellos. Sin eso, la
 herramienta filtra espacio justo en los proyectos que más han cambiado de forma.
+
+### El que sólo apareció en un proyecto de verdad
+
+El segundo es el de la poda por antigüedad en las raíces, contado más arriba, y
+merece una nota aparte por cómo se encontró: **ningún test ni fixture lo
+detectó**. Los fixtures se construyen compilando una configuración y ensuciando
+el `target/`, así que nunca tienen dos configuraciones del workspace compitiendo
+por ser la más reciente. Hizo falta un workspace de verdad, con meses de builds
+alternando features encima.
+
+La lección práctica: para una herramienta que borra, un fixture sintético valida
+el mecanismo pero no el criterio. El criterio sólo se valida contra un `target/`
+con historia.
+
+Y el método que lo demostró vale para cualquiera que toque esto:
+`cargo build --message-format=json` emite los artefactos **fresh** con su ruta
+real, así que da la lista exacta de lo que el build necesita, sin compilar nada.
+Cruzarla contra `--list-dead` es la prueba objetiva de si el mark es correcto.
 
 ## Qué está validado y qué no
 
@@ -194,10 +228,19 @@ separado: la papelera preserva la ruta relativa, la purga respeta la retención,
 `--no-trash` borra sin papelera, y con el `.cargo-lock` tomado por otro proceso
 el perfil se omite y no se toca nada suyo.
 
-**Sin validar.** Un workspace multi-crate con build script propio y tests de
-integración, compilado desde cero. El fixture no llegó a compilar en esta
-máquina: los build scripts mueren con SIGKILL, un problema del entorno macOS
-ajeno a la herramienta. Falta reproducirlo en Linux.
+**Validado end-to-end sobre un workspace real.** 10 paquetes, 3.246 unidades,
+31 GB de `target/` y meses de builds con distintos juegos de features. Cruzado
+contra la lista de artefactos *fresh* de Cargo: **0 de 306** unidades vivas
+marcadas como muertas. Se barrieron 3.95 GB, el `cargo build` siguiente quedó en
+no-op de 0.33s, y tocar un fuente recompiló **sólo** esa unidad, en 5.37s, sin
+cascada.
+
+Ese mismo proyecto, con la versión anterior, perdía 240 de esas 306 unidades.
+
+**Sin validar.** Linux. Todo lo anterior es macOS. Falta además un workspace
+multi-crate con build script propio compilado desde cero: el fixture no llega a
+compilar en esta máquina porque los build scripts mueren con SIGKILL, un
+problema del entorno ajeno a la herramienta.
 
 **Salvaguarda extra.** Un perfil sin ninguna unidad del workspace no se toca: es
 más probable que sea un perfil ajeno (sólo build scripts de dependencias) que
@@ -207,6 +250,15 @@ basura legítima. Se ve en el `x86_64-unknown-linux-musl/debug` del proyecto B.
 
 - [ ] **Validar en Linux**, donde los build scripts sí corren, con un workspace
       multi-crate compilado desde cero.
+- [ ] **Recuperar más sin volver a adivinar.** Hoy se conservan todas las
+      configuraciones del workspace, y eso deja espacio sobre la mesa: en el
+      proyecto A conviven 68 variantes de un mismo crate y casi todas están
+      muertas de verdad. El hash `config` del JSON de fingerprint es global por
+      invocación y sólo uno puede ser el vigente, así que las unidades con otro
+      son irrecuperables por definición. Falta una forma de saber cuál es el
+      vigente sin compilar; leerlo de la unidad más reciente vuelve a meter la
+      fecha en la ecuación, aunque a nivel de configuración es mucho menos
+      frágil que a nivel de unidad.
 - [ ] **No compila en Windows**: `build_en_curso()` usa `libc::flock` y
       `std::os::unix`. Bloqueante sólo para publicar en crates.io.
 - [ ] Modo "proyecto entero": evictar el `target/` completo de proyectos sin

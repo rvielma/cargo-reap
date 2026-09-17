@@ -107,6 +107,10 @@ fn collect_fingerprint_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) ->
         }
         match path.file_name().and_then(|n| n.to_str()) {
             Some(".fingerprint") => out.push(path),
+            // Nuestra propia papelera: dentro hay perfiles enteros ya barridos.
+            // Tratarlos como perfiles vivos infla el informe y, peor, los vuelve a
+            // planificar para barrer.
+            Some(crate::sweep::TRASH_DIR) => {}
             // No tiene sentido descender en estos.
             Some("deps") | Some("build") | Some("incremental") | Some(".rustc_info.json") => {}
             _ => collect_fingerprint_dirs(&path, depth + 1, out)?,
