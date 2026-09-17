@@ -40,7 +40,11 @@ fn run() -> Result<()> {
     let mut list_dead = false;
     let mut mode = sweep::Mode::DryRun;
     let mut incremental = false;
-    let mut codegen = false;
+    // Los .rcgu.o de unidades vivas se barren por defecto: son objetos
+    // intermedios que rustc reemite cuando recompila la unidad, y Cargo no los
+    // cuenta entre los outputs que verifica. Borrarlos no provoca ni un rebuild
+    // extra, y son la mayor parte de lo recuperable.
+    let mut codegen = true;
     let mut retain_days = 7u64;
     let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
@@ -65,6 +69,8 @@ fn run() -> Result<()> {
             }
             "--no-trash" => mode = sweep::Mode::Delete,
             "--incremental" => incremental = true,
+            "--keep-codegen" => codegen = false,
+            // Aceptado por compatibilidad: ya es el comportamiento por defecto.
             "--codegen" => codegen = true,
             "--retain-days" => {
                 let v = it.next().copied().unwrap_or("7");
@@ -88,10 +94,12 @@ fn run() -> Result<()> {
                 println!("  --no-trash         con --apply, borra directo, sin papelera.");
                 println!("  --retain-days N    purga los lotes de papelera con más de N");
                 println!("                     días (por defecto 7).");
-                println!("  --incremental      barre también incremental/, que es");
-                println!("                     desechable pero cuesta un build lento.");
-                println!("  --codegen          barre los .rcgu.o de unidades vivas:");
-                println!("                     objetos intermedios que rustc reemite solo.");
+                println!("  --incremental      barre también incremental/. Es desechable");
+                println!("                     por definición, pero deja el próximo build");
+                println!("                     lento. Es la otra mitad del espacio.");
+                println!("  --keep-codegen     NO barrer los .rcgu.o de unidades vivas.");
+                println!("                     Por defecto sí se barren: son intermedios");
+                println!("                     que rustc reemite y no cuestan un rebuild.");
                 println!();
                 println!("Si la ruta no es un target/, se buscan todos los target/");
                 println!("que cuelguen de ella y se procesan uno por uno.");

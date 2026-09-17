@@ -14,34 +14,41 @@ rustflag o la versión de rustc, escribe un artefacto nuevo con otro sufijo de
 hash y deja el anterior ahí para siempre. En un proyecto de vida larga la mayor
 parte de `target/` son cadáveres.
 
-Medido sobre 20 proyectos reales (septiembre 2026):
+Medido sobre 20 proyectos reales con 91.2 GB de `target/` (septiembre 2026):
 
-| proyecto | por defecto | `--incremental --codegen` |
-|----------|------------:|--------------------------:|
-| A        |          —* |  12.94 GB |
-| B        |   81.76 MB |  15.85 GB |
-| C        |          — |   6.09 GB |
-| D        |          — |   4.32 GB |
-| E        |    1.39 GB |   2.75 GB |
-| H        |  163.51 MB | 539.22 MB |
+| proyecto | por defecto | `--incremental` |
+|----------|------------:|----------------:|
+| B        |   11.56 GB |  15.85 GB |
+| A        |    8.65 GB |  12.94 GB |
+| C        |    3.01 GB |   6.09 GB |
+| D        |    2.22 GB |   4.32 GB |
+| E        |    1.69 GB |   2.75 GB |
+| H        |  355.20 MB | 539.22 MB |
+| K        |   72.21 MB | 157.73 MB |
 | I        |   16.66 MB |  16.66 MB |
 
-**1.64 GB recuperables** por defecto, **42.76 GB** con todo activado.
+**27.57 GB recuperables** por defecto — un 30% de todo lo que ocupan esos
+`target/` — y **42.76 GB**, casi la mitad, añadiendo `--incremental`.
 
-\* El proyecto A ya había sido recolectado por esta misma herramienta antes de
-esta medición (rindió unos 3.9 GB), así que la columna de la izquierda se queda
-corta en su parte. La de la derecha no: `incremental/` y los objetos de codegen
-se regeneran en cada build.
+De dónde sale ese espacio, que no es donde uno esperaría:
 
-Vale la pena leer esa diferencia con cuidado, porque contradice la intuición de
-partida. La recolección por grafo —la parte difícil, la que da nombre a esta
-herramienta— recupera unos pocos GB. El resto sale de `incremental/` y de los
-objetos de codegen de unidades vivas, que no dependen del análisis en absoluto:
-son desechables por construcción.
+| origen | recupera | cuesta |
+|--------|---------:|--------|
+| artefactos muertos (mark por grafo) | 1.64 GB | nada |
+| `.rcgu.o` de unidades vivas | 25.93 GB | nada |
+| `incremental/` | 15.19 GB | el próximo build es lento |
 
-Si sólo te interesa el espacio, `--incremental --codegen` es casi todo el
-beneficio. El mark por grafo es lo que permite además borrar artefactos muertos
-sin adivinar, que es un problema distinto.
+La recolección por grafo —la parte difícil, la que da nombre a esta
+herramienta— es la porción pequeña. El grueso son los objetos de codegen
+intermedios que rustc deja tirados en `deps/`: Cargo no los cuenta entre los
+outputs que verifica y los reemite si alguna vez recompila esa unidad, así que
+borrarlos no provoca ni una recompilación extra. Por eso van en el
+comportamiento por defecto.
+
+`incremental/` es igual de desechable pero sí tiene precio, así que queda detrás
+de un flag. Y el mark por grafo, aunque rinda poco en GB, es lo que permite
+borrar artefactos muertos sin adivinar, que es un problema distinto: es la
+diferencia entre recolectar y podar a ciegas.
 
 ## Por qué no sirve deduplicar
 
@@ -125,9 +132,10 @@ cargo reap <ruta-a-target>                     # simula: informa y no toca nada
 cargo reap <ruta-a-target> --apply             # mueve lo muerto a la papelera
 cargo reap <ruta-a-target> --apply --no-trash  # borra directo
 cargo reap <ruta-a-target> --keep-configs 3    # poda agresiva: puede forzar rebuild
+cargo reap <ruta-a-target> --keep-codegen     # no tocar los .rcgu.o vivos
 cargo reap <ruta-a-target> --list-dead         # rutas, una por línea
 
-cargo reap ~/Proyectos --apply --incremental --codegen   # todos de una pasada
+cargo reap ~/Proyectos --apply --incremental            # todos de una pasada
 ```
 
 Sin `--apply` no se modifica nada: el modo por defecto es simulación.
@@ -143,7 +151,7 @@ no interrumpe el recorrido. Es la forma pensada para un cron semanal.
 - `.fingerprint/` y `build/`, por directorio de unidad.
 - `incremental/` sólo con `--incremental`: es desechable por definición, pero el
   costo de borrarlo es un build lento, así que va aparte.
-- Los `.rcgu.o` de unidades **vivas**, sólo con `--codegen`. Son objetos de
+- Los `.rcgu.o` de unidades **vivas**, salvo que pases `--keep-codegen`. Son objetos de
   codegen intermedios que rustc reemite al recompilar la unidad, y Cargo no los
   cuenta entre los outputs que verifica: borrarlos no ensucia el fingerprint ni
   fuerza un rebuild. Es la bolsa más grande que queda — 11.49 GB sólo en el
@@ -239,10 +247,13 @@ scripts, compilado en dos configuraciones. Se marcó, se barrieron los 53
 archivos muertos (`deps/` de 45 MB a 23 MB) y el `cargo build` siguiente quedó
 en no-op de 0.01s sin recompilar nada.
 
-**Validado end-to-end, `--codegen`.** Sobre una copia de un proyecto real ya
-compilado: `deps/` pasó de 87 MB a 4.0 MB (2.441 objetos), `cargo build` siguió
-en no-op, y una recompilación de verdad —tocando un fuente— funcionó normal en
-0.30s. Se probó primero a mano y después a través de la herramienta.
+**Validado end-to-end, los `.rcgu.o` de unidades vivas.** Sobre una copia de un
+proyecto real ya compilado: `deps/` pasó de 87 MB a 4.0 MB (2.441 objetos),
+`cargo build` siguió en no-op, y una recompilación de verdad —tocando un
+fuente— funcionó normal en 0.30s. Repetido después sobre el workspace cruzado a
+musl: 67 objetos barridos, `cargo build` y `cargo build --tests` en no-op, y el
+`--release` posterior compiló sin novedad. Con LTO fat no hay nada que barrer:
+rustc emite bitcode y no deja objetos por unidad de codegen.
 
 **Validado end-to-end, fase sweep.** Sobre un target ya compilado con basura
 sintética inyectada (variantes con hash inventado en `deps/`, `.fingerprint/` y
