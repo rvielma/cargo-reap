@@ -299,7 +299,12 @@ cat > /tmp/signcc <<'EOF'
 cc "$@"; st=$?
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
-[ $st -eq 0 ] && [ -n "$out" ] && [ -f "$out" ] && codesign -f -s - "$out" 2>/dev/null
+# Sólo ejecutables: re-firmar un .dylib de proc-macro puede dejarlo ilegible
+# para dlopen.
+case "$out" in
+  *.dylib|*.so|*.a|*.rlib|"") ;;
+  *) [ $st -eq 0 ] && [ -f "$out" ] && codesign -f -s - "$out" 2>/dev/null ;;
+esac
 exit $st
 EOF
 chmod +x /tmp/signcc
