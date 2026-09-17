@@ -324,8 +324,15 @@ fn procesar_target(path: &Path, opts: &Opciones) -> Result<Totales> {
             sweep::purgar_papelera(path, Duration::from_secs(opts.retain_days * 86_400));
     }
 
+    // El conjunto vivo se calcula una sola vez sobre todos los perfiles: las
+    // aristas cruzan de perfil al cruzar-compilar. Ver [`conjunto_vivo`].
+    let vivos = conjunto_vivo(&profiles, &members, opts.keep_configs);
+    if opts.detallado && !opts.list_dead {
+        vivos.print();
+    }
+
     for profile in &profiles {
-        let report = analyze(profile, &members, opts.keep_configs, opts.list_dead)?;
+        let report = analyze(profile, &vivos, &members, opts.list_dead)?;
 
         if opts.list_dead {
             for f in &report.dead_paths {
@@ -463,12 +470,6 @@ fn stem_vigente(stem: &str, targets: &HashSet<String>) -> bool {
 /// Resultado del mark para un perfil.
 struct Report {
     units: usize,
-    edges_total: usize,
-    edges_resolved: usize,
-    units_sin_timestamp: usize,
-    roots: usize,
-    reachable: usize,
-    anchor: Option<SystemTime>,
     live_bytes: u64,
     dead_bytes: u64,
     dead_files: usize,
@@ -487,23 +488,6 @@ impl Report {
             println!("   sin unidades del workspace: no se toca nada");
         }
         println!("   unidades en .fingerprint : {}", self.units);
-        let pct = if self.edges_total > 0 {
-            100.0 * self.edges_resolved as f64 / self.edges_total as f64
-        } else {
-            0.0
-        };
-        println!(
-            "   aristas del grafo        : {}/{} resueltas ({:.1}%)",
-            self.edges_resolved, self.edges_total, pct
-        );
-        println!("   sin invoked.timestamp    : {}", self.units_sin_timestamp);
-        if let Some(a) = self.anchor {
-            println!("   actividad más reciente   : {}", fecha(a));
-        }
-        println!(
-            "   raíces                   : {}  ->  vivas por grafo: {}",
-            self.roots, self.reachable
-        );
         println!(
             "   deps/  vivo   {:>9}  ({} archivos)",
             human(self.live_bytes),
@@ -535,20 +519,59 @@ impl Report {
 ///
 /// La combinación sí funciona: las raíces recientes fijan la configuración actual
 /// y el cierre transitivo rescata sus dependencias por viejas que sean.
-fn analyze(
-    profile: &fingerprint::Profile,
+/// Conjunto vivo calculado sobre **todos** los perfiles del `target/` a la vez.
+///
+/// Es imprescindible que sea global: al cruzar-compilar, el grafo abarca dos
+/// directorios de perfil. Las unidades de `x86_64-unknown-linux-musl/release/`
+/// dependen de proc-macros y build scripts que viven en el `release/` del host,
+/// porque esos se compilan para la máquina que compila, no para el target.
+/// Analizando perfil por perfil esas aristas no resuelven, el lado host parece
+/// inalcanzable y se barre entero: en un workspace real eso marcaba como muertas
+/// 150 de las 581 unidades que el build necesitaba.
+struct Vivos {
+    hashes: HashSet<String>,
+    roots: usize,
+    reachable: usize,
+    edges_total: usize,
+    edges_resolved: usize,
+    anchor: Option<SystemTime>,
+}
+
+impl Vivos {
+    fn print(&self) {
+        let pct = if self.edges_total > 0 {
+            100.0 * self.edges_resolved as f64 / self.edges_total as f64
+        } else {
+            0.0
+        };
+        println!(
+            "grafo: {}/{} aristas resueltas ({:.1}%) · {} raíces -> {} unidades vivas",
+            self.edges_resolved, self.edges_total, pct, self.roots, self.reachable
+        );
+        if let Some(a) = self.anchor {
+            println!("actividad más reciente: {}", fecha(a));
+        }
+    }
+}
+
+fn conjunto_vivo(
+    profiles: &[fingerprint::Profile],
     members: &HashMap<String, HashSet<String>>,
     keep_configs: usize,
-    recolectar_rutas: bool,
-) -> Result<Report> {
-    let units = &profile.units;
-    let by_fp = fingerprint::index_by_fp_hash(units);
+) -> Vivos {
+    // Un único vector con las unidades de todos los perfiles, y un índice de
+    // fingerprint sobre él: así una arista puede cruzar de perfil sin perderse.
+    let units: Vec<&fingerprint::Unit> = profiles.iter().flat_map(|p| p.units.iter()).collect();
+    let mut by_fp: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, u) in units.iter().enumerate() {
+        if let Some(h) = u.fp_hash {
+            by_fp.entry(h).or_default().push(i);
+        }
+    }
 
-    // 1. ¿Cuántas aristas del grafo resuelven contra una unidad conocida?
-    //    Es la métrica que decide si el mark por grafo es viable offline.
     let mut edges_total = 0usize;
     let mut edges_resolved = 0usize;
-    for u in units {
+    for u in &units {
         for (_, fp) in &u.deps {
             edges_total += 1;
             if by_fp.contains_key(fp) {
@@ -557,29 +580,9 @@ fn analyze(
         }
     }
 
-    // 2. Raíces: TODAS las variantes de cada (paquete del workspace, tipo de unidad)
-    //    cuyo stem siga correspondiendo a un target declarado. Son los puntos de
-    //    entrada; todo lo demás sólo sobrevive si alguna de ellas lo alcanza.
-    //
-    //    Agrupar por el nombre de archivo completo (`lib-app_core`,
-    //    `test-lib-app_core`, `test-integration-test-schema_lifecycle`) da
-    //    justo la granularidad correcta: cada tipo de unidad conserva la suya.
-    //
-    //    No se poda por recencia salvo que el usuario lo pida con --keep-configs.
-    //    Quedarse con la variante más reciente parece razonable y es justo el error
-    //    que esta herramienta le critica a `cargo-sweep`: `invoked.timestamp` sólo
-    //    avanza en las unidades que Cargo RECOMPILA, así que la más reciente es la
-    //    de la última recompilación, no la de la próxima build. Un `cargo build
-    //    --features x` deja obsoleta, por fecha, la config del `cargo build` pelado
-    //    que sí vas a usar — y barrerla obliga a recompilar el árbol entero.
-    //
-    //    Además un mismo build abarca varios perfiles a la vez (deps del target,
-    //    build scripts y proc-macros en host), así que tampoco existe una única
-    //    "configuración vigente" que se pueda preservar.
-    let anchor = units.iter().filter_map(|u| u.invoked).max();
-    let roots = raices(units, members, keep_configs);
+    let propias: Vec<fingerprint::Unit> = units.iter().map(|u| (*u).clone()).collect();
+    let roots = raices(&propias, members, keep_configs);
 
-    // 3. Alcanzabilidad desde las raíces por las aristas `deps`.
     let mut visto: HashSet<usize> = HashSet::new();
     let mut pila: Vec<usize> = roots.clone();
     while let Some(i) = pila.pop() {
@@ -597,60 +600,56 @@ fn analyze(
         }
     }
 
-    // 4. El conjunto vivo, expresado como los sufijos de hash de `deps/`.
-    let vivos: HashSet<&str> = visto
-        .iter()
-        .map(|&i| units[i].filename_hash.as_str())
-        .collect();
-
-    // Sin raíces no hay nada que preservar y barreríamos el perfil entero. Es más
-    // probable que sea un perfil que no pertenece al workspace (sólo build scripts
-    // de dependencias) que basura legítima, así que no lo tocamos.
-    if roots.is_empty() {
-        let (bytes, _, files, _, _) = clasificar_deps(&profile.deps_dir, &vivos, false)?;
-        return Ok(Report {
-            units: units.len(),
-            edges_total,
-            edges_resolved,
-            units_sin_timestamp: units.iter().filter(|u| u.invoked.is_none()).count(),
-            roots: 0,
-            reachable: 0,
-            anchor,
-            live_bytes: bytes,
-            dead_bytes: 0,
-            live_files: files,
-            dead_files: 0,
-            huerfanos: 0,
-            dead_paths: Vec::new(),
-            sin_raices: true,
-            vivos: HashSet::new(),
-        });
+    Vivos {
+        hashes: visto
+            .iter()
+            .map(|&i| units[i].filename_hash.clone())
+            .collect(),
+        roots: roots.len(),
+        reachable: visto.len(),
+        edges_total,
+        edges_resolved,
+        anchor: units.iter().filter_map(|u| u.invoked).max(),
     }
+}
 
-    let (live_bytes, dead_bytes, live_files, dead_files, huerfanos, dead_paths) =
-        clasificar_deps_con_rutas(&profile.deps_dir, &vivos, recolectar_rutas)?;
-    let vivos_owned: HashSet<String> = vivos.iter().map(|s| s.to_string()).collect();
+/// Clasifica el `deps/` de un perfil contra el conjunto vivo global.
+fn analyze(
+    profile: &fingerprint::Profile,
+    vivos: &Vivos,
+    members: &HashMap<String, HashSet<String>>,
+    recolectar_rutas: bool,
+) -> Result<Report> {
+    let units = &profile.units;
+
+    // Un perfil sin ninguna unidad del workspace no se toca: es más probable que
+    // sea un perfil ajeno (sólo build scripts de dependencias) que basura.
+    let del_workspace = units.iter().any(|u| {
+        members
+            .get(u.pkg.as_str())
+            .is_some_and(|t| stem_vigente(&u.stem, t))
+    });
+
+    let (live_bytes, dead_bytes, live_files, dead_files, huerfanos, dead_paths) = if del_workspace {
+        clasificar_deps_con_rutas(&profile.deps_dir, &vivos.hashes, recolectar_rutas)?
+    } else {
+        let (bytes, _, files, _, h) = clasificar_deps(&profile.deps_dir, &vivos.hashes, false)?;
+        (bytes, 0, files, 0, h, Vec::new())
+    };
 
     Ok(Report {
         units: units.len(),
-        edges_total,
-        edges_resolved,
-        units_sin_timestamp: units.iter().filter(|u| u.invoked.is_none()).count(),
-        roots: roots.len(),
-        reachable: visto.len(),
-        anchor,
         live_bytes,
         dead_bytes,
         live_files,
         dead_files,
         huerfanos,
         dead_paths,
-        sin_raices: false,
-        vivos: vivos_owned,
+        sin_raices: !del_workspace,
+        vivos: vivos.hashes.clone(),
     })
 }
 
-/// Recorre `deps/` y reparte cada archivo entre vivo y muerto según su hash.
 /// Unidades del workspace que anclan el conjunto vivo.
 ///
 /// Con `keep_configs` al máximo (el valor por defecto) devuelve todas las
@@ -690,7 +689,7 @@ fn raices(
 
 fn clasificar_deps(
     deps_dir: &Path,
-    vivos: &HashSet<&str>,
+    vivos: &HashSet<String>,
     recolectar: bool,
 ) -> Result<(u64, u64, usize, usize, usize)> {
     let (a, b, c, d, e, _) = clasificar_deps_con_rutas(deps_dir, vivos, recolectar)?;
@@ -700,7 +699,7 @@ fn clasificar_deps(
 /// Igual que [`clasificar_deps`], devolviendo además la ruta de cada archivo muerto.
 fn clasificar_deps_con_rutas(
     deps_dir: &Path,
-    vivos: &HashSet<&str>,
+    vivos: &HashSet<String>,
     recolectar: bool,
 ) -> Result<(u64, u64, usize, usize, usize, Vec<PathBuf>)> {
     let mut live_bytes = 0u64;
@@ -848,6 +847,17 @@ mod tests {
         assert!(stem_vigente("run-build-script-build-script-build", &bs));
     }
 
+    /// Construye un perfil mínimo con las unidades dadas.
+    fn perfil(label: &str, units: Vec<fingerprint::Unit>) -> fingerprint::Profile {
+        fingerprint::Profile {
+            label: label.to_string(),
+            dir: PathBuf::from(label),
+            fingerprint_dir: PathBuf::from(label).join(".fingerprint"),
+            deps_dir: PathBuf::from(label).join("deps"),
+            units,
+        }
+    }
+
     /// Construye una unidad mínima para los tests de selección de raíces.
     fn unidad(pkg: &str, stem: &str, hash: &str, segundos: u64) -> fingerprint::Unit {
         fingerprint::Unit {
@@ -885,6 +895,35 @@ mod tests {
         let roots = raices(&units, &members, 1);
         assert_eq!(roots.len(), 1);
         assert_eq!(units[roots[0]].filename_hash, "bbbbbbbbbbbbbbbb");
+    }
+
+    /// Regresión: al cruzar-compilar, una unidad del target depende de un
+    /// proc-macro que vive en el perfil del host. Si el grafo se calcula perfil
+    /// por perfil, esa arista no resuelve y el proc-macro parece muerto.
+    #[test]
+    fn el_grafo_cruza_de_perfil() {
+        let mut host = unidad("macro_derive", "lib-macro_derive", "1111111111111111", 10);
+        host.fp_hash = Some(0xABCD);
+
+        let mut target_unit = unidad("app", "lib-app", "2222222222222222", 20);
+        target_unit.deps = vec![("macro_derive".to_string(), 0xABCD)];
+
+        let perfiles = vec![
+            perfil("x86_64-unknown-linux-musl/release", vec![target_unit]),
+            perfil("release", vec![host]),
+        ];
+        let mut members = HashMap::new();
+        members.insert(
+            "app".to_string(),
+            ["app".to_string()].into_iter().collect::<HashSet<String>>(),
+        );
+
+        let vivos = conjunto_vivo(&perfiles, &members, usize::MAX);
+        assert_eq!(vivos.edges_resolved, 1, "la arista debe cruzar de perfil");
+        assert!(
+            vivos.hashes.contains("1111111111111111"),
+            "el proc-macro del host tiene que quedar vivo"
+        );
     }
 
     /// Una unidad cuyo paquete ya no está en el workspace no ancla nada, por más

@@ -15,7 +15,6 @@
 //! vía `-C extra-filename`, así que mapea directo contra `deps/lib<crate>-<hash>.rlib`.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -286,17 +285,6 @@ pub fn parse_cargo_hash(s: &str) -> Option<u64> {
 /// ¿Parece un sufijo de hash de Cargo? (hex, 8 caracteres o más)
 fn is_hash(s: &str) -> bool {
     s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Índice de `fp_hash -> unidades`, para resolver las aristas del grafo.
-pub fn index_by_fp_hash(units: &[Unit]) -> HashMap<u64, Vec<usize>> {
-    let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, u) in units.iter().enumerate() {
-        if let Some(h) = u.fp_hash {
-            map.entry(h).or_default().push(i);
-        }
-    }
-    map
 }
 
 #[cfg(test)]

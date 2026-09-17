@@ -2,10 +2,10 @@
 
 Recolector de basura para directorios `target/` de Cargo.
 
-**Estado: funcional en macOS**, validado end-to-end sobre un workspace real de
-3.246 unidades. Identifica lo muerto (_mark_) y lo saca (_sweep_). Por defecto
-sólo simula: hay que pasar `--apply` para que toque algo. Falta validarlo en
-Linux.
+**Estado: funcional en macOS**, validado end-to-end sobre workspaces reales,
+incluido uno cruzado a `x86_64-unknown-linux-musl`. Identifica lo muerto (_mark_)
+y lo saca (_sweep_). Por defecto sólo simula: hay que pasar `--apply` para que
+toque algo. Falta ejecutarlo *en* Linux.
 
 ## El problema
 
@@ -14,25 +14,28 @@ rustflag o la versión de rustc, escribe un artefacto nuevo con otro sufijo de
 hash y deja el anterior ahí para siempre. En un proyecto de vida larga la mayor
 parte de `target/` son cadáveres.
 
-Medido sobre 20 proyectos reales que ocupan 91.2 GB de `target/`
-(septiembre 2026):
+Medido sobre 20 proyectos reales (septiembre 2026):
 
 | proyecto | por defecto | `--incremental --codegen` |
 |----------|------------:|--------------------------:|
-| A        |    3.95 GB |  16.81 GB |
-| B        |  580.68 MB |  16.34 GB |
+| A        |          —* |  12.94 GB |
+| B        |   81.76 MB |  15.85 GB |
 | C        |          — |   6.09 GB |
-| D        |    1.75 MB |   4.32 GB |
+| D        |          — |   4.32 GB |
 | E        |    1.39 GB |   2.75 GB |
 | H        |  163.51 MB | 539.22 MB |
-| I        |  104.50 MB | 104.50 MB |
-| J        |   16.66 MB |  16.66 MB |
+| I        |   16.66 MB |  16.66 MB |
 
-**6.18 GB recuperables** por defecto, **47.23 GB** con todo activado.
+**1.64 GB recuperables** por defecto, **42.76 GB** con todo activado.
+
+\* El proyecto A ya había sido recolectado por esta misma herramienta antes de
+esta medición (rindió unos 3.9 GB), así que la columna de la izquierda se queda
+corta en su parte. La de la derecha no: `incremental/` y los objetos de codegen
+se regeneran en cada build.
 
 Vale la pena leer esa diferencia con cuidado, porque contradice la intuición de
 partida. La recolección por grafo —la parte difícil, la que da nombre a esta
-herramienta— recupera 6.18 GB. Los otros 41 GB salen de `incremental/` y de los
+herramienta— recupera unos pocos GB. El resto sale de `incremental/` y de los
 objetos de codegen de unidades vivas, que no dependen del análisis en absoluto:
 son desechables por construcción.
 
@@ -83,7 +86,7 @@ componente temporal.
 ```mermaid
 flowchart TD
     A["cargo metadata --no-deps<br/>paquetes del workspace"] --> B
-    C["target/*/.fingerprint/<br/>todas las unidades"] --> B
+    C["TODOS los perfiles del target/<br/>.fingerprint/ en un solo grafo"] --> B
     B["raíces: TODAS las variantes<br/>de cada (paquete, tipo de unidad)<br/>con target declarado hoy"] --> D
     C --> E["grafo: aristas 'deps'<br/>del JSON de fingerprint"]
     E --> D["cierre transitivo<br/>desde las raíces"]
@@ -174,7 +177,7 @@ costarte un rebuild completo; la herramienta avisa por stderr cuando lo usas.
 No lo uses en un proyecto en el que alternes juegos de features, perfiles o
 toolchains. Lee la sección siguiente antes de decidir.
 
-## Los dos fallos que encontró la validación
+## Los tres fallos que encontró la validación
 
 ### El que encontró un fixture sintético
 
@@ -207,6 +210,28 @@ Y el método que lo demostró vale para cualquiera que toque esto:
 real, así que da la lista exacta de lo que el build necesita, sin compilar nada.
 Cruzarla contra `--list-dead` es la prueba objetiva de si el mark es correcto.
 
+### El que sólo aparece al cruzar-compilar
+
+Al compilar para otro target, el grafo abarca **dos** directorios de perfil.
+Las unidades de `x86_64-unknown-linux-musl/release/` dependen de proc-macros y
+build scripts que viven en el `release/` del host, porque esos se compilan para
+la máquina que compila, no para el target.
+
+La herramienta analizaba cada perfil por separado. Esas aristas no resolvían —el
+síntoma visible era un 95.2% de aristas resueltas en el perfil del target, contra
+~100% en los demás—, el lado host parecía inalcanzable y se marcaba entero como
+muerto: en un workspace real, **150 de las 581 unidades que el build necesitaba**,
+434 MB de proc-macros y `.rmeta`. Barrerlos obliga a recompilar el workspace
+completo, que con LTO son minutos.
+
+El arreglo es calcular el conjunto vivo una sola vez sobre todos los perfiles del
+`target/`, en un solo grafo. Después de eso las aristas resuelven al 100% y el
+perfil del host se queda entero.
+
+Un porcentaje de aristas resueltas por debajo de 100 no es una curiosidad
+estadística: es la señal de que al grafo le faltan nodos, y todo lo que colgaba
+de ellos está a punto de considerarse basura.
+
 ## Qué está validado y qué no
 
 **Validado end-to-end, fase mark.** Proyecto con dependencias reales y build
@@ -228,6 +253,18 @@ separado: la papelera preserva la ruta relativa, la purga respeta la retención,
 `--no-trash` borra sin papelera, y con el `.cargo-lock` tomado por otro proceso
 el perfil se omite y no se toca nada suyo.
 
+**Validado end-to-end cruzando a Linux.** Workspace multi-crate con build script
+propio en cada miembro y tests de integración, compilado desde cero contra
+`x86_64-unknown-linux-musl` con `cargo-zigbuild`, que reparte las unidades entre
+el perfil del host y el del target. Se inyectó basura real —un binario borrado y
+un test de integración renombrado—, se barrieron 27.46 MB y tanto `cargo build`
+como `cargo build --tests` siguieron en no-op; tocar un fuente recompiló sólo esa
+unidad.
+
+**Validado sobre un workspace real cruzado a musl.** 3.4 GB de artefactos Linux,
+47 build scripts. Cruzado contra la lista de artefactos *fresh* de Cargo: 0 de
+581 unidades vivas marcadas como muertas. Con la versión anterior eran 150.
+
 **Validado end-to-end sobre un workspace real.** 10 paquetes, 3.246 unidades,
 31 GB de `target/` y meses de builds con distintos juegos de features. Cruzado
 contra la lista de artefactos *fresh* de Cargo: **0 de 306** unidades vivas
@@ -237,10 +274,26 @@ cascada.
 
 Ese mismo proyecto, con la versión anterior, perdía 240 de esas 306 unidades.
 
-**Sin validar.** Linux. Todo lo anterior es macOS. Falta además un workspace
-multi-crate con build script propio compilado desde cero: el fixture no llega a
-compilar en esta máquina porque los build scripts mueren con SIGKILL, un
-problema del entorno ajeno a la herramienta.
+**Sin validar.** Ejecutar la herramienta *en* Linux. Todo lo anterior corre en
+macOS, aunque los artefactos analizados sean de Linux. Queda por comprobar ahí el
+`flock` sobre `.cargo-lock` y el rename de la papelera entre sistemas de archivos.
+
+**Nota para compilar en macOS arm64.** Los build scripts salen con una firma
+adhoc inválida y AMFI los mata con SIGKILL en cuanto Cargo los ejecuta. Se
+esquiva con un linker que re-firme lo que enlaza:
+
+```sh
+cat > /tmp/signcc <<'EOF'
+#!/bin/sh
+cc "$@"; st=$?
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+[ $st -eq 0 ] && [ -n "$out" ] && [ -f "$out" ] && codesign -f -s - "$out" 2>/dev/null
+exit $st
+EOF
+chmod +x /tmp/signcc
+CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/tmp/signcc cargo build
+```
 
 **Salvaguarda extra.** Un perfil sin ninguna unidad del workspace no se toca: es
 más probable que sea un perfil ajeno (sólo build scripts de dependencias) que
@@ -248,8 +301,7 @@ basura legítima. Se ve en el `x86_64-unknown-linux-musl/debug` del proyecto B.
 
 ## Lo que falta
 
-- [ ] **Validar en Linux**, donde los build scripts sí corren, con un workspace
-      multi-crate compilado desde cero.
+- [ ] **Ejecutar la herramienta en Linux** y validar ahí el `flock` y la papelera.
 - [ ] **Recuperar más sin volver a adivinar.** Hoy se conservan todas las
       configuraciones del workspace, y eso deja espacio sobre la mesa: en el
       proyecto A conviven 68 variantes de un mismo crate y casi todas están
